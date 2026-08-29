@@ -3,38 +3,51 @@ package za.co.acidian.xiaomitvremote
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
-import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyProperties
+import android.util.Base64
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.EOFException
 import java.io.InputStream
 import java.io.OutputStream
 import java.math.BigInteger
-import java.net.InetAddress
+import java.security.KeyFactory
 import java.security.KeyPairGenerator
-import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.PrivateKey
 import java.security.SecureRandom
+import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.security.interfaces.RSAPublicKey
+import java.security.spec.PKCS8EncodedKeySpec
 import java.util.Date
 import java.util.concurrent.Executors
 import javax.net.ssl.KeyManager
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLException
+import javax.net.ssl.SSLHandshakeException
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509ExtendedKeyManager
 import javax.net.ssl.X509TrustManager
 import javax.security.auth.x500.X500Principal
+import org.bouncycastle.asn1.x500.X500Name
+import org.bouncycastle.asn1.x509.BasicConstraints
+import org.bouncycastle.asn1.x509.Extension
+import org.bouncycastle.asn1.x509.GeneralName
+import org.bouncycastle.asn1.x509.GeneralNames
+import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
+import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 
 /**
- * Minimal native implementation of Android TV Remote Service v2.
- * Pairing uses TLS on 6467; control uses TLS on 6466.
- * Protobuf wire messages are encoded directly to keep the APK small and avoid generated sources.
+ * Native Android TV Remote Service v2 client.
+ * Pairing uses TLS on 6467; commands use TLS on 6466.
+ *
+ * The client identity intentionally uses an ordinary software RSA key rather than
+ * AndroidKeyStore. Some Android/Conscrypt combinations fail TLS client-auth when an
+ * AndroidKeyStore RSA key is presented to the Android TV pairing service.
  */
 class AndroidTvRemoteClient(
     private val context: Context,
@@ -79,13 +92,21 @@ class AndroidTvRemoteClient(
         private const val SERVICE_TYPE = "_androidtvremote2._tcp."
         private const val PAIR_PORT = 6467
         private const val REMOTE_PORT = 6466
-        private const val KEY_ALIAS = "xiaomi_tv_remote_client"
-        private const val FEATURE_FLAGS = 1 or 2 or 4 or 32 or 64 or 512 // ping,key,IME,power,volume,app-link
+        private const val CLIENT_ALIAS = "xiaomi_tv_remote_client"
+        private const val PREF_PRIVATE_KEY = "client_private_key_v2"
+        private const val PREF_CERTIFICATE = "client_certificate_v2"
+        private const val FEATURE_FLAGS = 1 or 2 or 4 or 32 or 64 or 512
     }
+
+    private data class ClientIdentity(
+        val privateKey: PrivateKey,
+        val certificate: X509Certificate,
+    )
 
     private val main = Handler(Looper.getMainLooper())
     private val io = Executors.newCachedThreadPool()
     private val prefs = context.getSharedPreferences("remote", Context.MODE_PRIVATE)
+    private val identity: ClientIdentity by lazy { loadOrCreateIdentity() }
     private val sslContext: SSLContext by lazy { createSslContext() }
 
     @Volatile private var remoteSocket: SSLSocket? = null
@@ -94,6 +115,7 @@ class AndroidTvRemoteClient(
     @Volatile private var pairingHost: String? = null
     @Volatile private var imeCounter: Int = 0
     @Volatile private var imeFieldCounter: Int = 0
+
     private val remoteWriteLock = Any()
     private val pairingWriteLock = Any()
     private var discoveryListener: NsdManager.DiscoveryListener? = null
@@ -109,29 +131,41 @@ class AndroidTvRemoteClient(
         val dl = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) = Unit
             override fun onDiscoveryStopped(serviceType: String) = Unit
+
             override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
-                postStatus("Discovery failed ($errorCode). You can enter the TV IP manually.")
+                postStatus("Discovery failed ($errorCode). Enter the TV IP manually.")
                 runCatching { nsd.stopServiceDiscovery(this) }
             }
+
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) = Unit
             override fun onServiceLost(serviceInfo: NsdServiceInfo) = Unit
+
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
                 if (!serviceInfo.serviceType.contains("androidtvremote2", ignoreCase = true)) return
                 @Suppress("DEPRECATION")
                 nsd.resolveService(serviceInfo, object : NsdManager.ResolveListener {
                     override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) = Unit
+
                     override fun onServiceResolved(info: NsdServiceInfo) {
                         val address = info.host?.hostAddress ?: return
-                        val d = TvDevice(info.serviceName.ifBlank { "Android TV" }, address, info.port.takeIf { it > 0 } ?: REMOTE_PORT)
-                        synchronized(found) { found[address] = d }
-                        main.post { listener.onDevices(synchronized(found) { found.values.toList() }) }
+                        val device = TvDevice(
+                            name = info.serviceName.ifBlank { "Android TV" },
+                            host = address,
+                            port = info.port.takeIf { it > 0 } ?: REMOTE_PORT,
+                        )
+                        synchronized(found) { found[address] = device }
+                        main.post {
+                            listener.onDevices(synchronized(found) { found.values.toList() })
+                        }
                     }
                 })
             }
         }
+
         discoveryListener = dl
         runCatching { nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, dl) }
             .onFailure { postStatus("Discovery unavailable. Enter the TV IP manually.") }
+
         main.postDelayed({
             stopDiscovery()
             if (found.isEmpty()) postStatus("No TV found automatically. Enter its IP address below.")
@@ -159,8 +193,9 @@ class AndroidTvRemoteClient(
                 Thread { remoteReadLoop(socket) }.start()
             } catch (e: Exception) {
                 remoteSocket = null
-                postStatus("Not paired or unavailable: ${friendly(e)}")
-                main.post { listener.onDisconnected(friendly(e)) }
+                val reason = friendly(e)
+                postStatus("Not paired or unavailable: $reason")
+                main.post { listener.onDisconnected(reason) }
             }
         }
     }
@@ -170,17 +205,20 @@ class AndroidTvRemoteClient(
         io.execute {
             closePairing()
             try {
-                postStatus("Opening pairing on $host…")
+                postStatus("Opening secure pairing with $host…")
                 val socket = openTls(host, PAIR_PORT)
                 pairingSocket = socket
                 pairingHost = host
                 pairingServerCert = socket.session.peerCertificates.firstOrNull() as? X509Certificate
                     ?: error("TV certificate unavailable")
 
+                postStatus("Pairing: negotiating…")
                 writePair(pairingRequest())
-                expectPairField(readFrame(socket.inputStream), 11, "pairing acknowledgement")
+                expectPairField(readFrame(socket.inputStream), 11, "request acknowledgement")
+
                 writePair(pairingOption())
                 expectPairField(readFrame(socket.inputStream), 20, "pairing options")
+
                 writePair(pairingConfiguration())
                 expectPairField(readFrame(socket.inputStream), 31, "pairing configuration")
 
@@ -197,14 +235,17 @@ class AndroidTvRemoteClient(
         io.execute {
             try {
                 val socket = pairingSocket ?: error("Pairing session expired")
-                val cert = pairingServerCert ?: error("TV certificate unavailable")
+                val serverCert = pairingServerCert ?: error("TV certificate unavailable")
                 val normalized = code.trim().uppercase()
                 require(normalized.length == 6 && normalized.all { it in "0123456789ABCDEF" }) {
-                    "Pairing code must be 6 hexadecimal characters"
+                    "Code must contain 6 hexadecimal characters"
                 }
-                val secret = pairingSecret(normalized, cert)
+
+                postStatus("Pairing: checking code…")
+                val secret = pairingSecret(normalized, serverCert)
                 writePair(pairingSecretMessage(secret))
                 expectPairField(readFrame(socket.inputStream), 41, "pairing confirmation")
+
                 val host = pairingHost ?: error("Pairing host unavailable")
                 prefs.edit().putString("last_host", host).apply()
                 closePairing()
@@ -218,14 +259,25 @@ class AndroidTvRemoteClient(
     }
 
     fun sendKey(keyCode: Int, direction: Int = 3) {
-        sendRemote(fieldMessage(10, concat(fieldVarint(1, keyCode.toLong()), fieldVarint(2, direction.toLong()))))
+        val key = concat(
+            fieldVarint(1, keyCode.toLong()),
+            fieldVarint(2, direction.toLong()),
+        )
+        sendRemote(fieldMessage(10, key))
     }
 
     fun sendText(text: String) {
         if (text.isEmpty()) return
         val pos = (text.length - 1).coerceAtLeast(0)
-        val imeObject = concat(fieldVarint(1, pos.toLong()), fieldVarint(2, pos.toLong()), fieldString(3, text))
-        val editInfo = concat(fieldVarint(1, 1), fieldMessage(2, imeObject))
+        val imeObject = concat(
+            fieldVarint(1, pos.toLong()),
+            fieldVarint(2, pos.toLong()),
+            fieldString(3, text),
+        )
+        val editInfo = concat(
+            fieldVarint(1, 1),
+            fieldMessage(2, imeObject),
+        )
         val batch = concat(
             fieldVarint(1, imeCounter.toLong()),
             fieldVarint(2, imeFieldCounter.toLong()),
@@ -253,23 +305,41 @@ class AndroidTvRemoteClient(
                 val top = parseFields(frame)
                 when {
                     top.containsKey(1) -> {
-                        val serverFeatures = parseFields(top.getValue(1).bytes ?: byteArrayOf())[1]?.varint?.toInt() ?: FEATURE_FLAGS
+                        val serverFeatures = parseFields(top.getValue(1).bytes ?: byteArrayOf())[1]
+                            ?.varint?.toInt() ?: FEATURE_FLAGS
                         val active = FEATURE_FLAGS and serverFeatures
                         val deviceInfo = concat(
-                            fieldVarint(3, 1), fieldString(4, "1"), fieldString(5, "atvremote"), fieldString(6, "1.0.0")
+                            fieldVarint(3, 1),
+                            fieldString(4, "1"),
+                            fieldString(5, "atvremote"),
+                            fieldString(6, "1.0.0"),
                         )
-                        sendRemote(fieldMessage(1, concat(fieldVarint(1, active.toLong()), fieldMessage(2, deviceInfo))))
+                        sendRemote(
+                            fieldMessage(
+                                1,
+                                concat(
+                                    fieldVarint(1, active.toLong()),
+                                    fieldMessage(2, deviceInfo),
+                                ),
+                            ),
+                        )
                     }
-                    top.containsKey(2) -> sendRemote(fieldMessage(2, fieldVarint(1, FEATURE_FLAGS.toLong())))
+
+                    top.containsKey(2) -> {
+                        sendRemote(fieldMessage(2, fieldVarint(1, FEATURE_FLAGS.toLong())))
+                    }
+
                     top.containsKey(8) -> {
                         val ping = parseFields(top.getValue(8).bytes ?: byteArrayOf())[1]?.varint ?: 0
                         sendRemote(fieldMessage(9, fieldVarint(1, ping)))
                     }
+
                     top.containsKey(21) -> {
                         val fields = parseFields(top.getValue(21).bytes ?: byteArrayOf())
                         imeCounter = fields[1]?.varint?.toInt() ?: imeCounter
                         imeFieldCounter = fields[2]?.varint?.toInt() ?: imeFieldCounter
                     }
+
                     top.containsKey(40) -> {
                         val started = parseFields(top.getValue(40).bytes ?: byteArrayOf())[1]?.varint == 1L
                         main.post { listener.onPowerChanged(started) }
@@ -279,8 +349,9 @@ class AndroidTvRemoteClient(
         } catch (e: Exception) {
             if (remoteSocket === socket) {
                 remoteSocket = null
-                postStatus("Disconnected: ${friendly(e)}")
-                main.post { listener.onDisconnected(friendly(e)) }
+                val reason = friendly(e)
+                postStatus("Disconnected: $reason")
+                main.post { listener.onDisconnected(reason) }
             }
         } finally {
             runCatching { socket.close() }
@@ -295,7 +366,9 @@ class AndroidTvRemoteClient(
                 return@execute
             }
             try {
-                synchronized(remoteWriteLock) { writeFrame(socket.outputStream, body) }
+                synchronized(remoteWriteLock) {
+                    writeFrame(socket.outputStream, body)
+                }
             } catch (e: Exception) {
                 postStatus("Command failed: ${friendly(e)}")
             }
@@ -304,7 +377,9 @@ class AndroidTvRemoteClient(
 
     private fun writePair(body: ByteArray) {
         val socket = pairingSocket ?: error("Pairing connection is closed")
-        synchronized(pairingWriteLock) { writeFrame(socket.outputStream, body) }
+        synchronized(pairingWriteLock) {
+            writeFrame(socket.outputStream, body)
+        }
     }
 
     private fun expectPairField(frame: ByteArray, expectedField: Int, stage: String) {
@@ -315,28 +390,50 @@ class AndroidTvRemoteClient(
     }
 
     private fun pairingRequest(): ByteArray = pairingOuter(
-        fieldMessage(10, concat(fieldString(1, "atvremote"), fieldString(2, "Xiaomi TV Remote")))
+        fieldMessage(
+            10,
+            concat(
+                fieldString(1, "atvremote"),
+                fieldString(2, "Xiaomi TV Remote"),
+            ),
+        ),
     )
 
     private fun pairingOption(): ByteArray {
-        val encoding = concat(fieldVarint(1, 3), fieldVarint(2, 6))
-        val option = concat(fieldMessage(1, encoding), fieldVarint(3, 1))
+        val encoding = concat(
+            fieldVarint(1, 3),
+            fieldVarint(2, 6),
+        )
+        val option = concat(
+            fieldMessage(1, encoding),
+            fieldVarint(3, 1),
+        )
         return pairingOuter(fieldMessage(20, option))
     }
 
     private fun pairingConfiguration(): ByteArray {
-        val encoding = concat(fieldVarint(1, 3), fieldVarint(2, 6))
-        val config = concat(fieldMessage(1, encoding), fieldVarint(2, 1))
+        val encoding = concat(
+            fieldVarint(1, 3),
+            fieldVarint(2, 6),
+        )
+        val config = concat(
+            fieldMessage(1, encoding),
+            fieldVarint(2, 1),
+        )
         return pairingOuter(fieldMessage(30, config))
     }
 
-    private fun pairingSecretMessage(secret: ByteArray): ByteArray = pairingOuter(fieldMessage(40, fieldBytes(1, secret)))
+    private fun pairingSecretMessage(secret: ByteArray): ByteArray =
+        pairingOuter(fieldMessage(40, fieldBytes(1, secret)))
 
-    private fun pairingOuter(payload: ByteArray): ByteArray = concat(fieldVarint(1, 2), fieldVarint(2, 200), payload)
+    private fun pairingOuter(payload: ByteArray): ByteArray = concat(
+        fieldVarint(1, 2),
+        fieldVarint(2, 200),
+        payload,
+    )
 
     private fun pairingSecret(pin: String, serverCert: X509Certificate): ByteArray {
-        val clientCert = keyStore().getCertificate(KEY_ALIAS) as X509Certificate
-        val clientKey = clientCert.publicKey as RSAPublicKey
+        val clientKey = identity.certificate.publicKey as RSAPublicKey
         val serverKey = serverCert.publicKey as RSAPublicKey
         val digest = MessageDigest.getInstance("SHA-256")
         digest.update(unsigned(clientKey.modulus))
@@ -345,13 +442,19 @@ class AndroidTvRemoteClient(
         digest.update(exponentBytes(serverKey.publicExponent))
         digest.update(hexToBytes(pin.substring(2)))
         val result = digest.digest()
-        require((result[0].toInt() and 0xff) == pin.substring(0, 2).toInt(16)) { "Code does not match this pairing session" }
+        require((result[0].toInt() and 0xff) == pin.substring(0, 2).toInt(16)) {
+            "Code does not match this pairing session"
+        }
         return result
     }
 
     private fun unsigned(value: BigInteger): ByteArray {
-        val b = value.toByteArray()
-        return if (b.size > 1 && b[0] == 0.toByte()) b.copyOfRange(1, b.size) else b
+        val bytes = value.toByteArray()
+        return if (bytes.size > 1 && bytes[0] == 0.toByte()) {
+            bytes.copyOfRange(1, bytes.size)
+        } else {
+            bytes
+        }
     }
 
     private fun exponentBytes(value: BigInteger): ByteArray {
@@ -368,85 +471,174 @@ class AndroidTvRemoteClient(
     private fun openTls(host: String, port: Int): SSLSocket {
         val socket = sslContext.socketFactory.createSocket(host, port) as SSLSocket
         socket.soTimeout = 20_000
-        socket.enabledProtocols = socket.supportedProtocols.filter { it == "TLSv1.2" || it == "TLSv1.3" }.toTypedArray()
+        val modern = socket.supportedProtocols.filter { it == "TLSv1.2" || it == "TLSv1.3" }
+        if (modern.isNotEmpty()) socket.enabledProtocols = modern.toTypedArray()
         socket.startHandshake()
         socket.soTimeout = 0
         return socket
     }
 
     private fun createSslContext(): SSLContext {
-        ensureIdentity()
+        val clientIdentity = identity
         val keyManager = object : X509ExtendedKeyManager() {
-            override fun chooseClientAlias(keyType: Array<out String>?, issuers: Array<out java.security.Principal>?, socket: java.net.Socket?) = KEY_ALIAS
-            override fun chooseServerAlias(keyType: String?, issuers: Array<out java.security.Principal>?, socket: java.net.Socket?) = null
-            override fun getCertificateChain(alias: String?) = if (alias == KEY_ALIAS) arrayOf(keyStore().getCertificate(KEY_ALIAS) as X509Certificate) else null
-            override fun getClientAliases(keyType: String?, issuers: Array<out java.security.Principal>?) = arrayOf(KEY_ALIAS)
-            override fun getPrivateKey(alias: String?): PrivateKey? = if (alias == KEY_ALIAS) keyStore().getKey(KEY_ALIAS, null) as? PrivateKey else null
-            override fun getServerAliases(keyType: String?, issuers: Array<out java.security.Principal>?) = null
+            override fun chooseClientAlias(
+                keyType: Array<out String>?,
+                issuers: Array<out java.security.Principal>?,
+                socket: java.net.Socket?,
+            ): String? = if (keyType == null || keyType.any { it.equals("RSA", true) }) CLIENT_ALIAS else null
+
+            override fun chooseServerAlias(
+                keyType: String?,
+                issuers: Array<out java.security.Principal>?,
+                socket: java.net.Socket?,
+            ): String? = null
+
+            override fun getCertificateChain(alias: String?): Array<X509Certificate>? =
+                if (alias == CLIENT_ALIAS) arrayOf(clientIdentity.certificate) else null
+
+            override fun getClientAliases(
+                keyType: String?,
+                issuers: Array<out java.security.Principal>?,
+            ): Array<String>? = if (keyType == null || keyType.equals("RSA", true)) arrayOf(CLIENT_ALIAS) else null
+
+            override fun getPrivateKey(alias: String?): PrivateKey? =
+                if (alias == CLIENT_ALIAS) clientIdentity.privateKey else null
+
+            override fun getServerAliases(
+                keyType: String?,
+                issuers: Array<out java.security.Principal>?,
+            ): Array<String>? = null
         }
+
         val trustAll = object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
             override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
             override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
         }
-        return SSLContext.getInstance("TLS").apply { init(arrayOf<KeyManager>(keyManager), arrayOf<TrustManager>(trustAll), SecureRandom()) }
+
+        return SSLContext.getInstance("TLS").apply {
+            init(
+                arrayOf<KeyManager>(keyManager),
+                arrayOf<TrustManager>(trustAll),
+                SecureRandom(),
+            )
+        }
     }
 
-    private fun ensureIdentity() {
-        val ks = keyStore()
-        if (ks.containsAlias(KEY_ALIAS)) return
+    private fun loadOrCreateIdentity(): ClientIdentity {
+        val storedKey = prefs.getString(PREF_PRIVATE_KEY, null)
+        val storedCert = prefs.getString(PREF_CERTIFICATE, null)
+        if (!storedKey.isNullOrBlank() && !storedCert.isNullOrBlank()) {
+            runCatching {
+                val keyBytes = Base64.decode(storedKey, Base64.NO_WRAP)
+                val certBytes = Base64.decode(storedCert, Base64.NO_WRAP)
+                val privateKey = KeyFactory.getInstance("RSA")
+                    .generatePrivate(PKCS8EncodedKeySpec(keyBytes))
+                val certificate = CertificateFactory.getInstance("X.509")
+                    .generateCertificate(ByteArrayInputStream(certBytes)) as X509Certificate
+                certificate.checkValidity(Date())
+                return ClientIdentity(privateKey, certificate)
+            }.onFailure {
+                prefs.edit()
+                    .remove(PREF_PRIVATE_KEY)
+                    .remove(PREF_CERTIFICATE)
+                    .apply()
+            }
+        }
+        return generateAndSaveIdentity()
+    }
+
+    private fun generateAndSaveIdentity(): ClientIdentity {
+        val generator = KeyPairGenerator.getInstance("RSA")
+        generator.initialize(2048, SecureRandom())
+        val pair = generator.generateKeyPair()
+
         val now = System.currentTimeMillis()
-        val generator = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, "AndroidKeyStore")
-        generator.initialize(
-            KeyGenParameterSpec.Builder(KEY_ALIAS, KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY)
-                .setKeySize(2048)
-                .setDigests(KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA512)
-                .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1)
-                .setCertificateSubject(X500Principal("CN=Xiaomi TV Remote"))
-                .setCertificateSerialNumber(BigInteger.valueOf(now))
-                .setCertificateNotBefore(Date(now - 86_400_000L))
-                .setCertificateNotAfter(Date(now + 3_153_600_000_000L))
-                .build()
+        val subject = X500Name(X500Principal("CN=Xiaomi TV Remote").name)
+        val builder = JcaX509v3CertificateBuilder(
+            subject,
+            BigInteger.valueOf(1000),
+            Date(now - 86_400_000L),
+            Date(now + 315_360_000_000L),
+            subject,
+            pair.public,
         )
-        generator.generateKeyPair()
-    }
+        builder.addExtension(Extension.basicConstraints, false, BasicConstraints(0))
+        builder.addExtension(
+            Extension.subjectAlternativeName,
+            false,
+            GeneralNames(GeneralName(GeneralName.dNSName, "xiaomi-tv-remote")),
+        )
 
-    private fun keyStore(): KeyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val signer = JcaContentSignerBuilder("SHA256withRSA").build(pair.private)
+        val certificate = JcaX509CertificateConverter().getCertificate(builder.build(signer))
+        certificate.verify(pair.public)
+
+        prefs.edit()
+            .putString(PREF_PRIVATE_KEY, Base64.encodeToString(pair.private.encoded, Base64.NO_WRAP))
+            .putString(PREF_CERTIFICATE, Base64.encodeToString(certificate.encoded, Base64.NO_WRAP))
+            .apply()
+
+        return ClientIdentity(pair.private, certificate)
+    }
 
     private fun disconnectRemote(notify: Boolean) {
-        val s = remoteSocket
+        val socket = remoteSocket
         remoteSocket = null
-        runCatching { s?.close() }
+        runCatching { socket?.close() }
         if (notify) main.post { listener.onDisconnected("Disconnected") }
     }
 
     private fun closePairing() {
-        val s = pairingSocket
+        val socket = pairingSocket
         pairingSocket = null
         pairingServerCert = null
         pairingHost = null
-        runCatching { s?.close() }
+        runCatching { socket?.close() }
     }
 
     private fun postStatus(text: String) = main.post { listener.onStatus(text) }
-    private fun friendly(e: Throwable): String = e.message ?: e.javaClass.simpleName
 
-    private data class FieldValue(val wire: Int, val varint: Long? = null, val bytes: ByteArray? = null)
+    private fun friendly(error: Throwable): String {
+        return when (error) {
+            is SSLHandshakeException -> "TLS handshake failed"
+            is SSLException -> "TLS error: ${error.message.orEmpty().lineSequence().firstOrNull().orEmpty().take(90)}"
+            else -> error.message?.lineSequence()?.firstOrNull()?.take(120)
+                ?: error.javaClass.simpleName
+        }
+    }
+
+    private data class FieldValue(
+        val wire: Int,
+        val varint: Long? = null,
+        val bytes: ByteArray? = null,
+    )
 
     private fun parseFields(data: ByteArray): Map<Int, FieldValue> {
         val out = linkedMapOf<Int, FieldValue>()
         var p = 0
         while (p < data.size) {
-            val (tag, np) = readVarint(data, p); p = np
-            val field = (tag ushr 3).toInt(); val wire = (tag and 7).toInt()
+            val (tag, nextPosition) = readVarint(data, p)
+            p = nextPosition
+            val field = (tag ushr 3).toInt()
+            val wire = (tag and 7).toInt()
             when (wire) {
-                0 -> { val (v, n) = readVarint(data, p); p = n; out[field] = FieldValue(wire, varint = v) }
-                1 -> p += 8
-                2 -> {
-                    val (len, n) = readVarint(data, p); p = n
-                    val end = (p + len.toInt()).coerceAtMost(data.size)
-                    out[field] = FieldValue(wire, bytes = data.copyOfRange(p, end)); p = end
+                0 -> {
+                    val (value, next) = readVarint(data, p)
+                    p = next
+                    out[field] = FieldValue(wire, varint = value)
                 }
+
+                1 -> p += 8
+
+                2 -> {
+                    val (length, next) = readVarint(data, p)
+                    p = next
+                    val end = (p + length.toInt()).coerceAtMost(data.size)
+                    out[field] = FieldValue(wire, bytes = data.copyOfRange(p, end))
+                    p = end
+                }
+
                 5 -> p += 4
                 else -> error("Unsupported protobuf wire type $wire")
             }
@@ -455,7 +647,9 @@ class AndroidTvRemoteClient(
     }
 
     private fun readVarint(data: ByteArray, offset: Int): Pair<Long, Int> {
-        var result = 0L; var shift = 0; var p = offset
+        var result = 0L
+        var shift = 0
+        var p = offset
         while (p < data.size && shift < 64) {
             val b = data[p++].toInt() and 0xff
             result = result or ((b and 0x7f).toLong() shl shift)
@@ -470,15 +664,16 @@ class AndroidTvRemoteClient(
         val data = ByteArray(length)
         var offset = 0
         while (offset < length) {
-            val n = input.read(data, offset, length - offset)
-            if (n < 0) throw EOFException("TV closed the connection")
-            offset += n
+            val read = input.read(data, offset, length - offset)
+            if (read < 0) throw EOFException("TV closed the connection")
+            offset += read
         }
         return data
     }
 
     private fun readVarint(input: InputStream): Long {
-        var result = 0L; var shift = 0
+        var result = 0L
+        var shift = 0
         while (shift < 64) {
             val b = input.read()
             if (b < 0) throw EOFException("TV closed the connection")
@@ -495,19 +690,30 @@ class AndroidTvRemoteClient(
         output.flush()
     }
 
-    private fun fieldVarint(field: Int, value: Long): ByteArray = concat(varint((field shl 3).toLong()), varint(value))
-    private fun fieldString(field: Int, value: String): ByteArray = fieldBytes(field, value.toByteArray(Charsets.UTF_8))
-    private fun fieldBytes(field: Int, value: ByteArray): ByteArray = concat(varint(((field shl 3) or 2).toLong()), varint(value.size.toLong()), value)
+    private fun fieldVarint(field: Int, value: Long): ByteArray =
+        concat(varint((field shl 3).toLong()), varint(value))
+
+    private fun fieldString(field: Int, value: String): ByteArray =
+        fieldBytes(field, value.toByteArray(Charsets.UTF_8))
+
+    private fun fieldBytes(field: Int, value: ByteArray): ByteArray =
+        concat(
+            varint(((field shl 3) or 2).toLong()),
+            varint(value.size.toLong()),
+            value,
+        )
+
     private fun fieldMessage(field: Int, body: ByteArray): ByteArray = fieldBytes(field, body)
 
     private fun varint(value: Long): ByteArray {
-        var v = value
+        var remaining = value
         val out = ByteArrayOutputStream()
         do {
-            var b = (v and 0x7f).toInt(); v = v ushr 7
-            if (v != 0L) b = b or 0x80
-            out.write(b)
-        } while (v != 0L)
+            var byte = (remaining and 0x7f).toInt()
+            remaining = remaining ushr 7
+            if (remaining != 0L) byte = byte or 0x80
+            out.write(byte)
+        } while (remaining != 0L)
         return out.toByteArray()
     }
 
