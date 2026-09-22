@@ -2,11 +2,11 @@
 
 An Android phone remote for Xiaomi / Android TV devices on the same local network.
 
-## Current milestone
+## Current status
 
-V0.1 establishes a native Kotlin + Jetpack Compose Android app and a GitHub Actions pipeline that produces a debug APK.
+A native Kotlin + Jetpack Compose Android app with a working Android TV Remote Protocol v2 client: LAN discovery (NSD), the mTLS pairing handshake with on-TV code entry, and persisted per-device client credentials. Once paired, the app sends real key events, volume/media commands, text input (IME batch edit), and app deep links over the protocol, it isn't a UI mockup.
 
-The visible remote UI includes navigation, Home/Back/Power, media and volume controls. Network discovery, pairing, and Android TV Remote Protocol communication are the next implementation milestone; the V0.1 buttons are intentionally UI-only until that transport is connected.
+A GitHub Actions pipeline builds a debug APK on every push.
 
 ## Download the APK
 
@@ -23,11 +23,11 @@ The CI build uses Java 17, Gradle 8.9, Android Gradle Plugin 8.7.3, Kotlin 2.0.2
 
 ## Roadmap
 
-- LAN Android TV discovery
-- Pairing-code flow
-- Persistent paired-device credentials
-- Android TV Remote Protocol commands
-- D-pad, OK, Back, Home, media and volume
-- Text/keyboard input
-- App-launch shortcuts
-- Touchpad mode
+Shipped: LAN discovery, pairing-code flow, persistent per-device credentials, D-pad/power/home/back, volume and media transport keys, text input, app-launch links.
+
+Remaining:
+
+- UI/UX redesign (theming, connect-vs-remote screen split, accessibility labels)
+- Touchpad mode (swipe-to-D-pad gesture translation — the protocol has no continuous pointer message, so this emulates a trackpad via accelerated key repeats, it isn't literal cursor injection)
+- ViewModel-based state management and unit tests for the protocol framing
+- Multi-device favorites
