@@ -340,13 +340,13 @@ private fun RemoteControlScreen(
             ) {
                 Text("More controls", fontWeight = FontWeight.Bold, fontSize = 18.sp)
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                    RemoteButton("Menu") { remote.sendKey(AndroidTvRemoteClient.KEY_MENU) }
-                    RemoteButton("Search") { remote.sendKey(AndroidTvRemoteClient.KEY_SEARCH) }
-                    RemoteButton("Settings") { remote.sendKey(AndroidTvRemoteClient.KEY_SETTINGS) }
+                    RemoteButton("Menu", { remote.sendKey(AndroidTvRemoteClient.KEY_MENU) })
+                    RemoteButton("Search", { remote.sendKey(AndroidTvRemoteClient.KEY_SEARCH) })
+                    RemoteButton("Settings", { remote.sendKey(AndroidTvRemoteClient.KEY_SETTINGS) })
                 }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                    RemoteButton("Sleep") { remote.sendKey(AndroidTvRemoteClient.KEY_SLEEP) }
-                    RemoteButton("Wake") { remote.sendKey(AndroidTvRemoteClient.KEY_WAKEUP) }
+                    RemoteButton("Sleep", { remote.sendKey(AndroidTvRemoteClient.KEY_SLEEP) })
+                    RemoteButton("Wake", { remote.sendKey(AndroidTvRemoteClient.KEY_WAKEUP) })
                 }
                 OutlinedTextField(
                     value = appLink,
@@ -428,7 +428,7 @@ private fun RemoteButton(
 
     Button(
         onClick = {
-            haptics.performHapticFeedback(HapticFeedbackType.VirtualKey)
+            haptics.performHapticFeedback(HapticFeedbackType.LongPress)
             onClick()
         },
         modifier = buttonModifier,
