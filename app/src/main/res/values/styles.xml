@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!-- Light theme (system light mode). Compose repaints everything; these values
+         only prevent a mismatch during launch and while the window is being drawn. -->
     <style name="Theme.XiaomiTvRemote" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:fontFamily">sans</item>
-        <item name="android:windowLightStatusBar">false</item>
-        <item name="android:statusBarColor">#111318</item>
-        <item name="android:navigationBarColor">#111318</item>
+        <item name="android:windowBackground">#F6F6FC</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
     </style>
 </resources>
